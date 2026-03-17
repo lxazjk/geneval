@@ -8,6 +8,8 @@ import os
 import re
 import sys
 import time
+import multiprocessing as mp
+from tqdm import tqdm
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -79,14 +81,15 @@ COLOR_CLASSIFIERS = {}
 # Evaluation parts
 
 class ImageCrops(torch.utils.data.Dataset):
-    def __init__(self, image: Image.Image, objects):
+    def __init__(self, image: Image.Image, objects, transform, *, crop: bool, bgcolor: str):
         self._image = image.convert("RGB")
-        bgcolor = args.options.get('bgcolor', "#999")
         if bgcolor == "original":
             self._blank = self._image.copy()
         else:
             self._blank = Image.new("RGB", image.size, color=bgcolor)
         self._objects = objects
+        self._transform = transform
+        self._crop = crop
 
     def __len__(self):
         return len(self._objects)
@@ -98,12 +101,12 @@ class ImageCrops(torch.utils.data.Dataset):
             image = Image.composite(self._image, self._blank, Image.fromarray(mask))
         else:
             image = self._image
-        if args.options.get('crop', '1') == '1':
+        if self._crop:
             image = image.crop(box[:4])
         # if args.save:
         #     base_count = len(os.listdir(args.save))
         #     image.save(os.path.join(args.save, f"cropped_{base_count:05}.png"))
-        return (transform(image), 0)
+        return (self._transform(image), 0)
 
 
 def color_classification(image, bboxes, classname):
@@ -118,9 +121,16 @@ def color_classification(image, bboxes, classname):
             DEVICE
         )
     clf = COLOR_CLASSIFIERS[classname]
+
+    # 多卡/多进程场景下，DataLoader 再起 worker 很容易触发嵌套多进程/全局变量不可用问题。
+    # 因此默认：多卡(num_gpus>1)时 clip_num_workers=0；单卡时维持原默认 4。
+    crop = args.options.get('crop', '1') == '1'
+    bgcolor = args.options.get('bgcolor', "#999")
+    num_gpus = int(args.options.get('num_gpus', 1))
+    clip_num_workers = int(args.options.get('clip_num_workers', 0 if num_gpus > 1 else 4))
     dataloader = torch.utils.data.DataLoader(
-        ImageCrops(image, bboxes),
-        batch_size=16, num_workers=4
+        ImageCrops(image, bboxes, transform, crop=crop, bgcolor=bgcolor),
+        batch_size=16, num_workers=clip_num_workers
     )
     with torch.no_grad():
         pred, _ = zsc.run_classification(clip_model, clf, dataloader, DEVICE)
@@ -258,21 +268,98 @@ def evaluate_image(filepath, metadata):
     }
 
 
-def main(args):
-    full_results = []
-    for subfolder in os.listdir(args.imagedir):
-        folderpath = os.path.join(args.imagedir, subfolder)
+def collect_tasks(imagedir):
+    tasks = []
+    for subfolder in os.listdir(imagedir):
+        folderpath = os.path.join(imagedir, subfolder)
         if not os.path.isdir(folderpath) or not subfolder.isdigit():
             continue
         with open(os.path.join(folderpath, "metadata.jsonl")) as fp:
             metadata = json.load(fp)
-        # Evaluate each image
-        for imagename in os.listdir(os.path.join(folderpath, "samples")):
-            imagepath = os.path.join(folderpath, "samples", imagename)
+        samples_dir = os.path.join(folderpath, "samples")
+        for imagename in os.listdir(samples_dir):
+            imagepath = os.path.join(samples_dir, imagename)
             if not os.path.isfile(imagepath) or not re.match(r"\d+\.png", imagename):
                 continue
-            result = evaluate_image(imagepath, metadata)
-            full_results.append(result)
+            tasks.append((imagepath, metadata))
+    return tasks
+
+
+def _parse_gpu_ids(gpu_ids_str, num_gpus):
+    if gpu_ids_str is None:
+        return list(range(num_gpus))
+    gpu_ids = [int(x) for x in gpu_ids_str.split(",") if x.strip()]
+    if not gpu_ids:
+        raise ValueError("gpu_ids is empty")
+    return gpu_ids
+
+
+def _worker(gpu_id, tasks, args_in, constants, out_q):
+    # IMPORTANT: set CUDA device before initializing models.
+    torch.cuda.set_device(gpu_id)
+
+    # Make globals available for ImageCrops / evaluate_image.
+    global args, object_detector, clip_model, transform, tokenizer, classnames
+    global THRESHOLD, COUNTING_THRESHOLD, MAX_OBJECTS, NMS_THRESHOLD, POSITION_THRESHOLD
+
+    args = args_in
+    THRESHOLD = constants["THRESHOLD"]
+    COUNTING_THRESHOLD = constants["COUNTING_THRESHOLD"]
+    MAX_OBJECTS = constants["MAX_OBJECTS"]
+    NMS_THRESHOLD = constants["NMS_THRESHOLD"]
+    POSITION_THRESHOLD = constants["POSITION_THRESHOLD"]
+
+    object_detector, (clip_model, transform, tokenizer), classnames = load_models(args)
+    local_results = []
+
+    iterator = tasks
+    if tqdm is not None:
+        iterator = tqdm(tasks, desc=f"eval gpu{gpu_id}", dynamic_ncols=True)
+
+    for imagepath, metadata in iterator:
+        local_results.append(evaluate_image(imagepath, metadata))
+    out_q.put(local_results)
+
+
+def main(args):
+    tasks = collect_tasks(args.imagedir)
+
+    num_gpus = int(args.options.get('num_gpus', 1))
+    gpu_ids = _parse_gpu_ids(args.options.get('gpu_ids', None), num_gpus)
+    if num_gpus <= 1:
+        iterator = tasks
+        if tqdm is not None:
+            iterator = tqdm(tasks, desc="eval", dynamic_ncols=True)
+        full_results = [evaluate_image(imagepath, metadata) for imagepath, metadata in iterator]
+    else:
+        if len(gpu_ids) != num_gpus:
+            raise ValueError(f"num_gpus={num_gpus} but gpu_ids has {len(gpu_ids)} entries")
+
+        constants = {
+            "THRESHOLD": THRESHOLD,
+            "COUNTING_THRESHOLD": COUNTING_THRESHOLD,
+            "MAX_OBJECTS": MAX_OBJECTS,
+            "NMS_THRESHOLD": NMS_THRESHOLD,
+            "POSITION_THRESHOLD": POSITION_THRESHOLD,
+        }
+
+        ctx = mp.get_context("spawn")
+        out_q = ctx.Queue()
+        procs = []
+        chunks = [tasks[i::num_gpus] for i in range(num_gpus)]
+        for rank, gpu_id in enumerate(gpu_ids):
+            p = ctx.Process(target=_worker, args=(gpu_id, chunks[rank], args, constants, out_q))
+            p.start()
+            procs.append(p)
+
+        full_results = []
+        for _ in range(num_gpus):
+            full_results.extend(out_q.get())
+
+        for p in procs:
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"worker process failed with exit code {p.exitcode}")
     # Save results
     if os.path.dirname(args.outfile):
         os.makedirs(os.path.dirname(args.outfile), exist_ok=True)
@@ -282,11 +369,13 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    object_detector, (clip_model, transform, tokenizer), classnames = load_models(args)
     THRESHOLD = float(args.options.get('threshold', 0.3))
     COUNTING_THRESHOLD = float(args.options.get('counting_threshold', 0.9))
     MAX_OBJECTS = int(args.options.get('max_objects', 16))
     NMS_THRESHOLD = float(args.options.get('max_overlap', 1.0))
     POSITION_THRESHOLD = float(args.options.get('position_threshold', 0.1))
 
+    num_gpus = int(args.options.get('num_gpus', 1))
+    if num_gpus <= 1:
+        object_detector, (clip_model, transform, tokenizer), classnames = load_models(args)
     main(args)
