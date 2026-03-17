@@ -122,8 +122,10 @@ def color_classification(image, bboxes, classname):
         )
     clf = COLOR_CLASSIFIERS[classname]
 
-    # 多卡/多进程场景下，DataLoader 再起 worker 很容易触发嵌套多进程/全局变量不可用问题。
-    # 因此默认：多卡(num_gpus>1)时 clip_num_workers=0；单卡时维持原默认 4。
+    # In multi-GPU / multi-process setups, spawning DataLoader workers often triggers nested
+    # multiprocessing and global-state issues. Therefore:
+    # - if num_gpus > 1: default clip_num_workers = 0
+    # - otherwise (single GPU): keep the original default clip_num_workers = 4
     crop = args.options.get('crop', '1') == '1'
     bgcolor = args.options.get('bgcolor', "#999")
     num_gpus = int(args.options.get('num_gpus', 1))
